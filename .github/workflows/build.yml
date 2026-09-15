@@ -1,0 +1,116 @@
+name: iOS 네이티브 빌드
+
+# 왜 수동/태그 트리거인가: 러너 한 번에 20~40분이 든다(테라코타가 크레이트 641개를
+# 받아 컴파일한다). 푸시마다 돌릴 이유가 없고, 실제로 필요한 건 "릴리스를 찍을 때"와
+# "업스트림이 움직였는지 주기적으로 확인할 때" 둘뿐이다.
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: '빌드할 대상 (space 구분, 비우면 전부)'
+        required: false
+        default: ''
+  push:
+    tags: ['v*']
+  schedule:
+    # ⚠️ 이게 이 워크플로의 진짜 목적에 가깝다. 우리 패치는 전부 하드 assert 위에
+    #    서 있어서, 업스트림이 앵커를 건드리면 **빌드가 그 자리에서 멈춘다**.
+    #    주 1회 돌려서 그 사실을 몇 달 뒤가 아니라 그 주에 알게 한다.
+    - cron: '0 18 * * 0'   # 매주 일요일 18:00 UTC (월요일 03:00 KST)
+
+permissions:
+  contents: write   # 태그 빌드에서 릴리스에 붙이기 위함
+
+jobs:
+  build:
+    # macOS 러너여야 한다 — iOS SDK 와 codesign 이 필요하다.
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 도구 설치
+        run: |
+          brew install ninja
+          # cmake · rustup 은 러너에 이미 있다. 타깃만 추가한다.
+          rustup target add aarch64-apple-ios
+
+      - name: Xcode 선택
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      # ── 렌더러 ──────────────────────────────────────────────────────────
+      - name: MobileGlues
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'mobileglues') }}
+        run: EMIT_PATCH_DIR="$PWD/patches-built" ./Scripts/build-mobileglues.sh
+
+      - name: SPIRV-Cross
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'spirv') }}
+        run: ./Scripts/build-spirv-cross.sh
+
+      # ── LWJGL 3.4.1 (마인크래프트 26.2) ─────────────────────────────────
+      - name: LWJGL 네이티브
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'lwjgl') }}
+        run: ./Scripts/build-lwjgl-natives.sh
+
+      - name: 자바 스택 (LWJGL 3.4.1)
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'javaapp') }}
+        run: LWJGL_VERSION=3.4.1 EMIT_PATCH_DIR="$PWD/patches-built" ./Scripts/build-javaapp.sh
+
+      # ── 온라인 LAN ──────────────────────────────────────────────────────
+      - name: 테라코타
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'terracotta') }}
+        run: EMIT_PATCH_DIR="$PWD/patches-built" ./Scripts/build-terracotta.sh --release
+
+      # ── 검증 ────────────────────────────────────────────────────────────
+      # cargo·cmake 는 타깃을 틀려도 조용히 성공한다. 맥용 바이너리가 섞여 나오면
+      # 앱에 넣는 순간에야 알게 되므로 여기서 잘라낸다.
+      - name: iOS arm64 인지 확인
+        run: |
+          fail=0
+          while IFS= read -r f; do
+            info=$(lipo -info "$f" 2>/dev/null || true)
+            case "$info" in *arm64*) ;; *) echo "::error file=$f::arm64 가 아닙니다 — $info"; fail=1; continue ;; esac
+            plats=$(otool -l "$f" | sed -n 's/^ *platform //p' | sort -u | tr '\n' ' ')
+            case "$plats" in "2 ") ;; *) echo "::error file=$f::iOS 전용이 아닙니다 (platform=$plats)"; fail=1 ;; esac
+            printf '  ✓ %s\n' "${f#./Runtime/}"
+          done < <(find ./Runtime -name '*.dylib' -o -name '*.a')
+          exit $fail
+
+      # 패치가 우리가 저장소에 적어 둔 것과 같은지 본다. 달라졌다면 업스트림이
+      # 움직였다는 뜻이고, patches/ 를 갱신해야 한다.
+      - name: 저장된 패치와 대조
+        if: ${{ inputs.targets == '' }}
+        run: |
+          for p in patches-built/*.patch; do
+            name=$(basename "$p")
+            if ! diff -q "patches/$name" "$p" >/dev/null 2>&1; then
+              echo "::warning file=patches/$name::업스트림이 바뀌어 패치 결과가 달라졌습니다"
+              diff -u "patches/$name" "$p" | head -40 || true
+            else
+              printf '  ✓ %s\n' "$name"
+            fi
+          done
+
+      - name: 산출물 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-natives-${{ github.sha }}
+          path: |
+            Runtime/**/*.dylib
+            Runtime/**/*.a
+            Runtime/libs*/*.jar
+            patches-built/*.patch
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 릴리스에 붙이기
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cd Runtime && zip -qr ../ios-natives-${{ github.ref_name }}.zip . && cd ..
+          gh release create "${{ github.ref_name }}" \
+            --title "${{ github.ref_name }}" \
+            --notes "iOS(arm64) 네이티브. 각 모듈의 업스트림과 라이선스는 NOTICE 참조." \
+            ios-natives-${{ github.ref_name }}.zip
+        env:
+          GH_TOKEN: ${{ github.token }}
