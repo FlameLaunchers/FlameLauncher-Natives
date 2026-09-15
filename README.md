@@ -7,7 +7,14 @@
 [![Platform](https://img.shields.io/badge/target-iOS%20arm64-000000?logo=apple&logoColor=white)](#)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue)](LICENSE)
 
+**[🇰🇷 한국어](#-한국어)** · **[🇺🇸 English](#-english)**
+
 </div>
+
+---
+---
+
+# 🇰🇷 한국어
 
 ---
 
@@ -216,3 +223,216 @@ AGPL-3.0 이라 저장소 전체를 그에 맞춥니다.
 
 > Minecraft 는 Mojang AB 의 상표입니다. 이 프로젝트는 Mojang AB · Microsoft 와
 > 아무 관련이 없습니다.
+
+<div align="right"><a href="#-flamelauncher-natives">⬆ 맨 위로</a></div>
+
+---
+---
+
+# 🇺🇸 English
+
+**Build scripts that produce the iOS arm64 natives a Minecraft Java launcher needs.**
+
+Running Minecraft Java on iOS means building the renderer, LWJGL, GLFW and the P2P
+networking for `aarch64-apple-ios` — and **no upstream ships an iOS build.** Where an
+Android build exists, it does not even compile as-is.
+
+This repository is the set of patches that close that gap. It was written for
+[FlameLauncher for iOS](https://github.com/FlameLaunchers/FlameLauncher-iOS) but
+**references no app code at all** — PojavLauncher iOS, Amethyst and others can use it
+unchanged.
+
+## Layout
+
+```
+Scripts/     the build scripts; CI runs exactly these
+patches/     the complete diff each script produces, as readable unified diffs
+licenses/    the full licence text of every upstream that gets patched
+```
+
+**Patched upstream trees are not vendored.** With submodules that would be hundreds of
+megabytes, of which 974 lines actually changed. Instead each script clones, patches and
+builds at build time, and writes the resulting diff into `patches/`.
+
+```bash
+EMIT_PATCH_DIR=patches ./Scripts/build-mobileglues.sh   # regenerate
+```
+
+| Script | Patches | Asserts | Diff | Output |
+|---|---|---|---|---|
+| `build-mobileglues.sh` | 19 | 29 | 766 lines | `libmobileglues.dylib` |
+| `build-terracotta.sh` | 7 | 7 | 137 lines | `libterracotta.a` |
+| `build-javaapp.sh` | 3 | 3 | 71 lines | `lwjgl.jar` · `launcher.jar` |
+| `build-lwjgl-natives.sh` | — | — | — | `liblwjgl*.dylib` (3.4.1) |
+| `build-spirv-cross.sh` | — | — | — | `libspirv-cross.dylib` |
+
+Every patch sits behind a hard `assert`, so when upstream moves **the build stops right
+there** rather than silently missing and producing a wrong binary.
+
+## Usage
+
+```bash
+brew install cmake ninja xcodegen
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # for Terracotta
+
+./Scripts/build-mobileglues.sh
+./Scripts/build-terracotta.sh --release
+./Scripts/build-spirv-cross.sh
+./Scripts/build-lwjgl-natives.sh
+LWJGL_VERSION=3.4.1 ./Scripts/build-javaapp.sh
+```
+
+Everything lands under `Runtime/`.
+
+## CI
+
+[`.github/workflows/build.yml`](.github/workflows/build.yml) runs those same scripts on a
+macOS runner.
+
+- **Manual dispatch** — optionally pick targets (`mobileglues terracotta`)
+- **`v*` tags** — zips the output and attaches it to the release
+- **Weekly schedule** — closest to the real point. Because every patch stands on a hard
+  assert, an upstream change to an anchor stops the build; the weekly run means you learn
+  that **the same week** rather than months later.
+
+Two verification steps:
+
+1. **Confirm the output is iOS arm64.** `cargo` and `cmake` will happily succeed with the
+   wrong target. A macOS binary slipping through is only discovered when the app fails to
+   load it, so every artefact's `lipo -info` and `LC_BUILD_VERSION` (platform 2 = iOS) is
+   checked, and the job fails if it does not match.
+2. **Compare against the stored patches.** If the freshly generated diff differs from
+   `patches/`, the job warns and prints the difference.
+
+## What the patches fix
+
+### `build-mobileglues.sh` — the renderer (19 patches)
+
+MobileGlues translates desktop GL into GLES. Upstream's CMake has an iOS branch, but it
+**has never been compiled** — the releases are APKs.
+
+**Things that simply don't build:** `__attribute__((alias))` (absent on Mach-O), the Linux
+syscall number `__NR_gettid`, and `-Wl,-Bsymbolic-functions` (GNU ld only).
+
+**Things that break because the iOS host is ES 3.0.** The Android host is ES 3.2; on iOS
+the host is ANGLE Metal, which is **ES 3.0**. ANGLE exports the whole ES 3.2 symbol set but
+refuses the calls on an ES 3.0 context — **no error, nothing happens.** Fallbacks are added
+for `glFramebufferTexture` (3.2) and `glGetTexLevelParameteriv` (3.1).
+
+**Why shaders rendered nothing.** With Iris on, entities and the held item were invisible.
+
+> Metal requires the **signedness** of a vertex format to match the shader declaration.
+> GL and GLES do not.
+
+Feeding `GL_UNSIGNED_SHORT` to an attribute declared `ivec3` passes in GL and makes Metal
+reject the pipeline outright. The fix walks the program's integer attributes just before
+drawing and re-binds them with matching signedness.
+
+> This took a long time to find for a reason. MobileGlues' `CHECK_GL_ERROR` sits behind
+> `#if GLOBAL_DEBUG`, so in a default build **all 226 call sites compile to `{}`.** The
+> observation "there are no GL errors" rested on nothing. A companion patch turns error
+> logging on permanently.
+
+**A lookup that skipped its own library.** The Apple branch of `glx/lookup.cpp` reads:
+
+```c
+return dlsym((void*)(~(uintptr_t)0), name);
+```
+
+`~0` is `(void*)-1`, and that value means different things per platform. **On Android
+(LP64) it is `RTLD_DEFAULT`; on Apple it is `RTLD_NEXT`** — search the objects *after* me.
+So MobileGlues never returned its own `gl*` and handed back ANGLE's instead.
+
+LWJGL 3.3.3 never takes this path, so it stayed hidden. 3.4.1 added `eglGetProcAddress` to
+its `GetProcAddress` candidates and walked straight into it: **every** GL function then
+resolved to ANGLE, `glGetIntegerv` reported ES 3.0, LWJGL mapped no GL 3.3+ entry points,
+and Minecraft 26.2 died on a null `glGenSamplers`. `RTLD_SELF` fixes it.
+
+**Memory.** A high-resolution server resource pack makes Minecraft build an 8192² atlas —
+268 MB as RGBA8, and briefly twice that with the upload buffer, which exceeds the iOS
+budget (about 3 GB on an iPhone 15) and gets the process jetsammed. The patch shrinks by
+powers of two *only when the remaining headroom cannot hold it*, scaling sub-uploads to
+match. UVs are normalised, so the image still lands correctly.
+
+### `build-terracotta.sh` — online LAN (7 patches)
+
+The **first iOS build** of [Terracotta](https://github.com/PCL-Community/Terracotta-lib)
+(built on EasyTier).
+
+Upstream [burningtnt/Terracotta](https://github.com/burningtnt/Terracotta) cannot work on
+iOS at all: it embeds an EasyTier executable and spawns it as a child process, which the
+iOS sandbox forbids. Only the PCL fork, which links EasyTier as a crate, is usable.
+
+Remarkably, **exactly one compile failure is iOS-specific**: `InterfaceFilter` has no iOS
+implementation, and the macOS one shells out to `networksetup`, which iOS does not have.
+Mobile has no way to filter interfaces, so iOS joins the Android branch (accept everything).
+The rest were dependency version drift.
+
+**A new FFI.** Upstream exposes JNI only. But Terracotta already serves its entire control
+surface over HTTP — that is what the desktop UI uses — so one native entry point suffices:
+
+```c
+uint16_t terracotta_ios_start(const char *dataDir);   // start the control server, return its port
+```
+
+Everything else is `http://127.0.0.1:<port>/state/…`. Smaller surface than hand-writing an
+FFI per call, and less to break when upstream moves.
+
+> **No TUN.** On iOS a TUN device means a Network Extension, and that entitlement cannot be
+> signed with a free developer account. EasyTier's no-TUN mode applies, with its documented
+> limitation: hosting works, joining needs the address entered by hand.
+
+### `build-lwjgl-natives.sh` — LWJGL 3.4.1
+
+Required by Minecraft 26.2, and **not mixable with 3.3.3** — 3.4 introduced new callback
+infrastructure (`Upcalls`, `ffi_get_closure_size`, `Callback$Descriptor`), so the Java side
+and the natives must match.
+
+The delicate part is **libffi's closure layout**. `FFI_EXEC_TRAMPOLINE_TABLE` (1 on iOS)
+changes the field offsets of `ffi_closure`, and LWJGL's `ffi.h` gates that on
+`defined(LWJGL_MACOS) && defined(LWJGL_arm64)` — **lowercase `arm64`**. Passing
+`LWJGL_ARM64` silently selects the wrong offsets, a callback's `user_data` reads as 0, and
+the game dies.
+
+### `build-javaapp.sh` — GLFW shims (3 patches)
+
+Builds the JavaApp from [Amethyst-iOS](https://github.com/AngelAuraMC/Amethyst-iOS) while
+filling in the surface LWJGL 3.4.1 widened: `glfwPlatformSupported`, `glfwGetMonitorName`,
+and three IME/preedit callbacks.
+
+It also closes a latent NPE. `glfwGetInputMode` unboxes the result of an empty `HashMap`
+lookup directly, so **asking for any mode that was never set is an unconditional crash**.
+Minecraft 26.2 asks for `GLFW_IME` (new in 3.4) every tick. Rather than special-casing IME,
+the guard goes in the one function, with defaults matching real GLFW (`NORMAL` for the
+cursor, `FALSE` otherwise).
+
+### `build-spirv-cross.sh`
+
+Minecraft 26.2's blaze3d wants `libspirv-cross`. Only the `spvc_*` C API is needed, so the
+dylib exports just that.
+
+## Upstreams
+
+| | Licence |
+|---|---|
+| [MobileGlues](https://github.com/MobileGL-Dev/MobileGlues) | LGPL-2.1-only |
+| [Terracotta-lib](https://github.com/PCL-Community/Terracotta-lib) | AGPL-3.0 |
+| [EasyTier](https://github.com/EasyTier/EasyTier) | LGPL-3.0 |
+| [Amethyst-iOS](https://github.com/AngelAuraMC/Amethyst-iOS) | GPL-3.0 |
+| [LWJGL](https://github.com/LWJGL/lwjgl3) | BSD-3-Clause |
+| [libffi](https://github.com/libffi/libffi) | MIT |
+| [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Apache-2.0 |
+
+## Licence
+
+**AGPL-3.0.** This repository holds no upstream source, but a patch is a derivative of the
+file it modifies and carries that file's licence. The strongest among them is Terracotta's
+AGPL-3.0, so the repository as a whole matches it.
+
+Every upstream's full licence text is in [`licenses/`](licenses), verbatim. Which patch
+follows which licence is tabulated in [NOTICE](NOTICE).
+
+> Minecraft is a trademark of Mojang AB. This project is not affiliated with, endorsed by,
+> or connected to Mojang AB or Microsoft.
+
+<div align="right"><a href="#-flamelauncher-natives">⬆ Back to top</a></div>
