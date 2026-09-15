@@ -190,7 +190,9 @@ BUILD="$WORK/src/JavaApp/build"
 echo "▸ FlameLauncher 자체 부트스트랩 컴파일"
 # Forge/NeoForge 프로세서를 게임 JVM 안에서 돌리는 래퍼. (JavaSrc/ 참고)
 mkdir -p "$WORK/flame"
-"$BOOTJDK/javac" -d "$WORK/flame" $(find "$ROOT/JavaSrc" -name '*.java')
+# ⚠️ FlameAllocator 는 org.lwjgl.system.MemoryUtil.MemoryAllocator 를 구현한다 —
+#    방금 만든 lwjgl.jar 을 컴파일 클래스패스에 넣어야 한다(런타임에도 같은 jar 을 쓴다).
+"$BOOTJDK/javac" -cp "$BUILD/lwjgl.jar" -d "$WORK/flame" $(find "$ROOT/JavaSrc" -name '*.java')
 # ⚠️ 매니페스트가 있어야 한다 — 이 jar 은 **자바 에이전트이기도 하다**(IosFsAgent).
 #    Premain-Class 가 없으면 -javaagent 가 조용히 실패하고, toRealPath 가 다시 막힌다.
 cat > "$WORK/agent-manifest.txt" <<'MANIFEST'

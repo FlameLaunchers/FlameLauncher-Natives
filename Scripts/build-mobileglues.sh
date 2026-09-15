@@ -658,6 +658,53 @@ s = s.replace(old, new, 1)
 p.write_text(s)
 print("  glx/lookup.cpp: 애플에서 자기 심볼을 먼저 찾게 (RTLD_NEXT → RTLD_SELF)")
 
+# 14b) glGetIntegerv(GL_MAX_TEXTURE_SIZE) 를 MG_MAX_TEXTURE_DIM 으로 **낮춰서 답한다**.
+#
+#      패치 15 는 업로드되는 텍스처를 줄인다 — GPU 쪽만 줄어든다. 그런데 마인크래프트의
+#      텍스처 아틀라스는 그 전에 **CPU 에서** 만들어진다:
+#
+#          int i = RenderSystem.maxSupportedTextureSize();   // = GL_MAX_TEXTURE_SIZE
+#          new Stitcher<>(i, i, mipLevel);                   // 이 한도까지 붙인다
+#
+#      그래서 서버 리소스팩이 크면 8192x8192 NativeImage 가 힙 **밖에** 잡힌다.
+#      RGBA 로 268 MB 다. 아이폰 15 의 jetsam 예산이 3071 MB 인데 실측 사망 지점이
+#      3005~3061 MB 였으니, 이 한 장이 곧 사망 원인이다. 업로드를 줄여 봐야
+#      이미 만들어진 CPU 사본은 그대로라 소용이 없었다(로그에 8192x8192 가 그대로 찍혔다).
+#
+#      한도를 낮춰 답하면 마인크래프트가 **처음부터** 작은 아틀라스를 붙인다.
+#      스프라이트는 자동으로 여러 장으로 나뉜다 — 화질 손실 없이 최대 크기만 줄어든다.
+p = src / "gl/getter.cpp"
+s = p.read_text()
+
+old = """    case GL_MAX_TEXTURE_IMAGE_UNITS: {"""
+new = """    case GL_MAX_TEXTURE_SIZE: {
+        int es_params = 4096;
+        GLES.glGetIntegerv(pname, &es_params);
+        CHECK_GL_ERROR
+        // MG_MAX_TEXTURE_DIM 이 있으면 그보다 크게 답하지 않는다. 호출자(마인크래프트)는
+        // 이 값을 **아틀라스를 만들기 전에** 읽어서 스티처 한도로 쓰므로, 여기서 낮추면
+        // 힙 밖 NativeImage 자체가 작아진다. (빌드 스크립트의 패치 14b 주석 참고)
+        static const long forced = [] {
+            const char* v = getenv("MG_MAX_TEXTURE_DIM");
+            return v ? strtol(v, nullptr, 10) : 0L;
+        }();
+        if (forced > 0 && es_params > forced) {
+            LOG_W_FORCE("MGTEX GL_MAX_TEXTURE_SIZE %d -> %ld (상한 강제)", es_params, forced)
+            es_params = (int)forced;
+        }
+        (*params) = es_params;
+        break;
+    }
+    case GL_MAX_TEXTURE_IMAGE_UNITS: {"""
+assert old in s, "getter.cpp: GL_MAX_TEXTURE_IMAGE_UNITS 분기를 못 찾았습니다 (업스트림이 바뀜)"
+s = s.replace(old, new, 1)
+
+if "#include <cstdlib>" not in s:
+    s = s.replace("#include", "#include <cstdlib>\n#include", 1)
+
+p.write_text(s)
+print("  gl/getter.cpp: GL_MAX_TEXTURE_SIZE 를 MG_MAX_TEXTURE_DIM 으로 제한")
+
 # 15) 들어갈 자리가 없는 거대 텍스처는 강제로 줄여서 잡는다.
 #
 #     서버 리소스팩이 고해상도면 마인크래프트가 블록 아틀라스를 8192x8192 로 만든다.
@@ -731,6 +778,10 @@ int mg_shrink_needed(GLsizei width, GLsizei height, int bpp) {
         int shift = 0;
         while ((width >> shift) > forced || (height >> shift) > forced) {
             if (++shift >= 4) break;
+        }
+        if (shift > 0) {
+            LOG_W_FORCE("MGTEX %dx%d -> %dx%d (상한 %ld 강제)",
+                        width, height, width >> shift, height >> shift, forced)
         }
         return shift;
     }
