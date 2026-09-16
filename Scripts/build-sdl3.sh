@@ -169,6 +169,18 @@ for decl in [
     #    스레드에 묶이므로 메인으로 넘기면 그리는 스레드에서 current 가 아니게 된다.
     "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)",
     "bool SDL_GL_DestroyContext(SDL_GLContext context)",
+    # ⚠️ **getter 도 감싸야 한다.** setter 만 감쌌더니 그대로 터졌다 —
+    #    이것들은 UIWindow·UIScreen 을 조회하므로 UIKit 호출이다.
+    "bool SDL_GetWindowPosition(SDL_Window *window, int *x, int *y)",
+    "bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)",
+    "bool SDL_GetWindowSizeInPixels(SDL_Window *window, int *w, int *h)",
+    "SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *window)",
+    "SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *window)",
+    "SDL_DisplayID SDL_GetPrimaryDisplay(void)",
+    "bool SDL_GetDisplayBounds(SDL_DisplayID displayID, SDL_Rect *rect)",
+    "bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect *rect)",
+    "const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID)",
+    "const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID displayID)",
 ]:
     wrap("src/video/SDL_video.c", decl)
 
