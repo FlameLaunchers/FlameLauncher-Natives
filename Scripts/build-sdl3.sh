@@ -69,75 +69,90 @@ COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF)
 patch_ios_mainthread() {
   local src="$1"
   python3 - "$src" <<'SDLPATCH'
-import pathlib, sys
+import pathlib, re, sys
 root = pathlib.Path(sys.argv[1])
 
-HELPER = """
-/* ── FlameLauncher 패치: UIKit 진입점을 메인 스레드로 ───────────────────────
+PRELUDE = """
+/* ── FlameLauncher: UIKit 진입점을 메인 스레드로 ──────────────────────────
    자세한 사정은 Scripts/build-sdl3.sh 의 patch_ios_mainthread 주석 참고. */
 #ifdef SDL_PLATFORM_IOS
 #include <dispatch/dispatch.h>
 #include <pthread.h>
-#define FLAME_ON_MAIN(ctx_type, ctx_init, body)                    \\
-    do {                                                            \\
-        if (pthread_main_np()) { body }                             \\
-    } while (0)
 #endif
 """
 
-def wrap(path, anchor, ctx, thunk, wrapper):
+def split_arg(a):
+    """'const SDL_DisplayMode *mode' -> ('const SDL_DisplayMode *', 'mode')"""
+    a = a.strip()
+    m = re.match(r"^(.*?)([A-Za-z_][A-Za-z_0-9]*)$", a)
+    return m.group(1).strip(), m.group(2)
+
+def wrap(path, decl):
+    """decl 예: 'bool SDL_SetWindowTitle(SDL_Window *window, const char *title)'"""
     p = root / path
     s = p.read_text()
-    assert anchor in s, f"{path}: 앵커를 못 찾았습니다 — {anchor}"
-    # ⚠️ **함수 이름만** 바꾼다. 앵커 전체에 replace 를 걸면 반환 타입이 먼저 걸려서
-    #    `SDL_Window *SDL_CreateWindowWithProperties` 가
-    #    `flame_real_SDL_Window *SDL_Create…` 가 된다(unknown type name).
-    name = anchor.split("(")[0].split()[-1].lstrip("*")
-    renamed = anchor.replace(name + "(", "flame_real_" + name + "(", 1)
-    s = s.replace(anchor, "static " + renamed, 1)
-    # 파일 끝에 래퍼를 붙인다(원본 정의가 먼저 와야 한다).
-    s += "\n" + ctx + thunk + wrapper + "\n"
+    assert decl in s, f"{path}: 앵커를 못 찾았습니다 — {decl}"
+
+    head, argstr = decl.split("(", 1)
+    argstr = argstr.rstrip(")")
+    name = re.match(r"^.*?([A-Za-z_][A-Za-z_0-9]*)$", head.strip()).group(1)
+    ret = head.strip()[: -len(name)].strip()
+    args = [] if argstr.strip() in ("", "void") else [split_arg(a) for a in argstr.split(",")]
+
+    # ⚠️ 함수 이름만 바꾼다. decl 전체에 replace 를 걸면 반환 타입이 먼저 걸린다
+    #    (SDL_Window *SDL_CreateWindow… → flame_real_SDL_Window *…).
+    s = s.replace(decl, "static " + decl.replace(name + "(", "flame_real_" + name + "(", 1), 1)
+
+    fields = "".join(f"    {t} {n};\n" for t, n in args)
+    voidret = ret == "void"
+    if not voidret:
+        fields += f"    {ret} result;\n"
+    call = f"flame_real_{name}(" + ", ".join(f"c->{n}" for _, n in args) + ")"
+    direct = f"flame_real_{name}(" + ", ".join(n for _, n in args) + ")"
+    assign = "" if voidret else "c->result = "
+    setup = "".join(f"    c.{n} = {n};\n" for _, n in args)
+
+    s += f"""
+#ifdef SDL_PLATFORM_IOS
+struct flame_ctx_{name} {{
+{fields}}};
+static void flame_thunk_{name}(void *p) {{
+    struct flame_ctx_{name} *c = (struct flame_ctx_{name} *)p;
+    {assign}{call};
+}}
+{decl} {{
+    if (pthread_main_np()) {{ {'' if voidret else 'return '}{direct}; {'return;' if voidret else ''} }}
+    struct flame_ctx_{name} c;
+{setup}    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_thunk_{name});
+    {'' if voidret else 'return c.result;'}
+}}
+#endif
+"""
     p.write_text(s)
-    print(f"  {path}: {anchor.split('(')[0].split()[-1]} 을 메인 스레드로")
+    print(f"  {path}: {name}")
 
-wrap("src/SDL.c",
-     "bool SDL_InitSubSystem(SDL_InitFlags flags)",
-     "\n#ifdef SDL_PLATFORM_IOS\n#include <dispatch/dispatch.h>\n#include <pthread.h>\n"
-     "struct flame_init_ctx { SDL_InitFlags flags; bool result; };\n",
-     "static void flame_init_thunk(void *p) {\n"
-     "    struct flame_init_ctx *c = (struct flame_init_ctx *)p;\n"
-     "    c->result = flame_real_SDL_InitSubSystem(c->flags);\n}\n",
-     "bool SDL_InitSubSystem(SDL_InitFlags flags) {\n"
-     "    if (pthread_main_np()) return flame_real_SDL_InitSubSystem(flags);\n"
-     "    struct flame_init_ctx c; c.flags = flags; c.result = false;\n"
-     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_init_thunk);\n"
-     "    return c.result;\n}\n#endif\n")
+for path in ("src/SDL.c", "src/video/SDL_video.c"):
+    q = root / path
+    q.write_text(q.read_text() + PRELUDE)
 
-wrap("src/video/SDL_video.c",
-     "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)",
-     "\n#ifdef SDL_PLATFORM_IOS\n#include <dispatch/dispatch.h>\n#include <pthread.h>\n"
-     "struct flame_win_ctx { SDL_PropertiesID props; SDL_Window *result; };\n",
-     "static void flame_win_thunk(void *p) {\n"
-     "    struct flame_win_ctx *c = (struct flame_win_ctx *)p;\n"
-     "    c->result = flame_real_SDL_CreateWindowWithProperties(c->props);\n}\n",
-     "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props) {\n"
-     "    if (pthread_main_np()) return flame_real_SDL_CreateWindowWithProperties(props);\n"
-     "    struct flame_win_ctx c; c.props = props; c.result = NULL;\n"
-     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_win_thunk);\n"
-     "    return c.result;\n}\n#endif\n")
+# ⚠️ GL 함수는 감싸지 않는다. SDL_GL_SwapWindow 는 매 프레임 불리고, GL 컨텍스트는
+#    스레드에 묶이므로 메인으로 넘기면 정작 그리는 스레드에서 current 가 아니게 된다.
+#    (GL 은 우리 ANGLE 로 대체할 예정이라 어차피 이 경로를 안 탄다)
+wrap("src/SDL.c", "bool SDL_InitSubSystem(SDL_InitFlags flags)")
 
-wrap("src/video/SDL_video.c",
-     "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)",
-     "\n#ifdef SDL_PLATFORM_IOS\n"
-     "struct flame_gl_ctx { SDL_Window *window; SDL_GLContext result; };\n",
-     "static void flame_gl_thunk(void *p) {\n"
-     "    struct flame_gl_ctx *c = (struct flame_gl_ctx *)p;\n"
-     "    c->result = flame_real_SDL_GL_CreateContext(c->window);\n}\n",
-     "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window) {\n"
-     "    if (pthread_main_np()) return flame_real_SDL_GL_CreateContext(window);\n"
-     "    struct flame_gl_ctx c; c.window = window; c.result = NULL;\n"
-     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_gl_thunk);\n"
-     "    return c.result;\n}\n#endif\n")
+for decl in [
+    "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)",
+    "void SDL_DestroyWindow(SDL_Window *window)",
+    "bool SDL_SetWindowIcon(SDL_Window *window, SDL_Surface *icon)",
+    "bool SDL_SetWindowBordered(SDL_Window *window, bool bordered)",
+    "bool SDL_SetWindowSize(SDL_Window *window, int w, int h)",
+    "bool SDL_SetWindowPosition(SDL_Window *window, int x, int y)",
+    "bool SDL_SetWindowMinimumSize(SDL_Window *window, int min_w, int min_h)",
+    "bool SDL_SetWindowMaximumSize(SDL_Window *window, int max_w, int max_h)",
+    "bool SDL_SetWindowFullscreenMode(SDL_Window *window, const SDL_DisplayMode *mode)",
+    "bool SDL_RaiseWindow(SDL_Window *window)",
+]:
+    wrap("src/video/SDL_video.c", decl)
 SDLPATCH
 }
 
