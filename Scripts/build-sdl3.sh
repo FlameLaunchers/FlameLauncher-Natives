@@ -131,7 +131,7 @@ static void flame_thunk_{name}(void *p) {{
     p.write_text(s)
     print(f"  {path}: {name}")
 
-for path in ("src/SDL.c", "src/video/SDL_video.c"):
+for path in ("src/SDL.c", "src/video/SDL_video.c", "src/events/SDL_mouse.c"):
     q = root / path
     q.write_text(q.read_text() + PRELUDE)
 
@@ -151,8 +151,34 @@ for decl in [
     "bool SDL_SetWindowMaximumSize(SDL_Window *window, int max_w, int max_h)",
     "bool SDL_SetWindowFullscreenMode(SDL_Window *window, const SDL_DisplayMode *mode)",
     "bool SDL_RaiseWindow(SDL_Window *window)",
+    "bool SDL_ShowWindow(SDL_Window *window)",
+    "bool SDL_HideWindow(SDL_Window *window)",
+    "bool SDL_SetWindowFullscreen(SDL_Window *window, bool fullscreen)",
+    "bool SDL_SyncWindow(SDL_Window *window)",
+    "bool SDL_SetWindowTitle(SDL_Window *window, const char *title)",
+    "bool SDL_SetWindowMouseGrab(SDL_Window *window, bool grabbed)",
+    "bool SDL_SetWindowResizable(SDL_Window *window, bool resizable)",
+    "bool SDL_SetWindowAlwaysOnTop(SDL_Window *window, bool on_top)",
+    "bool SDL_MaximizeWindow(SDL_Window *window)",
+    "bool SDL_MinimizeWindow(SDL_Window *window)",
+    "bool SDL_RestoreWindow(SDL_Window *window)",
+    # ⚠️ GL **컨텍스트 생성**만 감싼다. CAEAGLLayer 를 만들며 UIKit 을 건드리기
+    #    때문이다. EAGL 컨텍스트는 나중에 다른 스레드에서 current 로 만들 수 있으므로
+    #    메인에서 만들어도 문제가 없다.
+    #    SwapWindow/MakeCurrent 는 감싸지 않는다 — 매 프레임 불리고 컨텍스트가
+    #    스레드에 묶이므로 메인으로 넘기면 그리는 스레드에서 current 가 아니게 된다.
+    "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)",
+    "bool SDL_GL_DestroyContext(SDL_GLContext context)",
 ]:
     wrap("src/video/SDL_video.c", decl)
+
+# 마우스 커서 조작도 UIKit 을 탄다(SDL_mouse.c).
+for decl in [
+    "void SDL_WarpMouseInWindow(SDL_Window *window, float x, float y)",
+    "bool SDL_ShowCursor(void)",
+    "bool SDL_HideCursor(void)",
+]:
+    wrap("src/events/SDL_mouse.c", decl)
 SDLPATCH
 }
 
