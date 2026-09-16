@@ -49,6 +49,98 @@ echo "  버전 $ver"
 # 공통 옵션. 테스트·예제는 필요 없고, 우리는 정적/동적을 플랫폼마다 다르게 쓴다.
 COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF)
 
+# ⚠️ iOS: UIKit 을 건드리는 진입점을 **메인 스레드로 넘긴다**.
+#
+#    SDL 의 uikit 백엔드는 UIWindow·UIScreen·CAEAGLLayer 를 만지므로 메인 스레드에서만
+#    안전하다. 그런데 SDL 은 "SDL_Init 을 부른 스레드"를 메인으로 간주할 뿐이고
+#    (src/SDL.c 의 SDL_MainThreadID), 진짜 UIKit 메인 스레드인지는 보지 않는다.
+#
+#    우리 구조에서는 그게 어긋난다. `-XstartOnFirstThread` 의 "첫 스레드"는 JLI 를 부른
+#    스레드인데 런처는 JVM 을 백그라운드에서 띄운다 — 그래서 마인크래프트가
+#    "Render thread" 라 부르는 JVM 메인이 UIKit 관점에서는 백그라운드다. 실측:
+#      [FlameSDL] SDL_Init 호출 — 현재 스레드: 백그라운드   → 로그 한 줄 없이 사망
+#      (메인 큐로 넘기면)     ✅ SDL_Init(VIDEO) 성공 — 드라이버 'uikit'
+#
+#    래퍼 dylib 도 검토했지만 나머지 심볼을 전부 다시 내보내야 해서(트램폴린 생성)
+#    원본을 고치는 쪽이 훨씬 작다. MobileGlues 에 쓰는 방식과 같다.
+#
+# ⚠️ 두 파일 다 `.c` 라 ObjC 블록을 못 쓴다. GCD 의 C API(dispatch_sync_f)를 쓴다.
+# ⚠️ 이미 메인이면 dispatch_sync 는 교착이다. pthread_main_np() 로 먼저 가른다.
+patch_ios_mainthread() {
+  local src="$1"
+  python3 - "$src" <<'SDLPATCH'
+import pathlib, sys
+root = pathlib.Path(sys.argv[1])
+
+HELPER = """
+/* ── FlameLauncher 패치: UIKit 진입점을 메인 스레드로 ───────────────────────
+   자세한 사정은 Scripts/build-sdl3.sh 의 patch_ios_mainthread 주석 참고. */
+#ifdef SDL_PLATFORM_IOS
+#include <dispatch/dispatch.h>
+#include <pthread.h>
+#define FLAME_ON_MAIN(ctx_type, ctx_init, body)                    \\
+    do {                                                            \\
+        if (pthread_main_np()) { body }                             \\
+    } while (0)
+#endif
+"""
+
+def wrap(path, anchor, ctx, thunk, wrapper):
+    p = root / path
+    s = p.read_text()
+    assert anchor in s, f"{path}: 앵커를 못 찾았습니다 — {anchor}"
+    # ⚠️ **함수 이름만** 바꾼다. 앵커 전체에 replace 를 걸면 반환 타입이 먼저 걸려서
+    #    `SDL_Window *SDL_CreateWindowWithProperties` 가
+    #    `flame_real_SDL_Window *SDL_Create…` 가 된다(unknown type name).
+    name = anchor.split("(")[0].split()[-1].lstrip("*")
+    renamed = anchor.replace(name + "(", "flame_real_" + name + "(", 1)
+    s = s.replace(anchor, "static " + renamed, 1)
+    # 파일 끝에 래퍼를 붙인다(원본 정의가 먼저 와야 한다).
+    s += "\n" + ctx + thunk + wrapper + "\n"
+    p.write_text(s)
+    print(f"  {path}: {anchor.split('(')[0].split()[-1]} 을 메인 스레드로")
+
+wrap("src/SDL.c",
+     "bool SDL_InitSubSystem(SDL_InitFlags flags)",
+     "\n#ifdef SDL_PLATFORM_IOS\n#include <dispatch/dispatch.h>\n#include <pthread.h>\n"
+     "struct flame_init_ctx { SDL_InitFlags flags; bool result; };\n",
+     "static void flame_init_thunk(void *p) {\n"
+     "    struct flame_init_ctx *c = (struct flame_init_ctx *)p;\n"
+     "    c->result = flame_real_SDL_InitSubSystem(c->flags);\n}\n",
+     "bool SDL_InitSubSystem(SDL_InitFlags flags) {\n"
+     "    if (pthread_main_np()) return flame_real_SDL_InitSubSystem(flags);\n"
+     "    struct flame_init_ctx c; c.flags = flags; c.result = false;\n"
+     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_init_thunk);\n"
+     "    return c.result;\n}\n#endif\n")
+
+wrap("src/video/SDL_video.c",
+     "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)",
+     "\n#ifdef SDL_PLATFORM_IOS\n#include <dispatch/dispatch.h>\n#include <pthread.h>\n"
+     "struct flame_win_ctx { SDL_PropertiesID props; SDL_Window *result; };\n",
+     "static void flame_win_thunk(void *p) {\n"
+     "    struct flame_win_ctx *c = (struct flame_win_ctx *)p;\n"
+     "    c->result = flame_real_SDL_CreateWindowWithProperties(c->props);\n}\n",
+     "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props) {\n"
+     "    if (pthread_main_np()) return flame_real_SDL_CreateWindowWithProperties(props);\n"
+     "    struct flame_win_ctx c; c.props = props; c.result = NULL;\n"
+     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_win_thunk);\n"
+     "    return c.result;\n}\n#endif\n")
+
+wrap("src/video/SDL_video.c",
+     "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window)",
+     "\n#ifdef SDL_PLATFORM_IOS\n"
+     "struct flame_gl_ctx { SDL_Window *window; SDL_GLContext result; };\n",
+     "static void flame_gl_thunk(void *p) {\n"
+     "    struct flame_gl_ctx *c = (struct flame_gl_ctx *)p;\n"
+     "    c->result = flame_real_SDL_GL_CreateContext(c->window);\n}\n",
+     "SDL_GLContext SDL_GL_CreateContext(SDL_Window *window) {\n"
+     "    if (pthread_main_np()) return flame_real_SDL_GL_CreateContext(window);\n"
+     "    struct flame_gl_ctx c; c.window = window; c.result = NULL;\n"
+     "    dispatch_sync_f(dispatch_get_main_queue(), &c, flame_gl_thunk);\n"
+     "    return c.result;\n}\n#endif\n")
+SDLPATCH
+}
+
 build_ios() {
   echo "▸ iOS arm64"
   # ⚠️ **dylib** 으로 만든다. LWJGL 의 org.lwjgl.sdl.SDL 은 정적 심볼을 찾지 않고
@@ -56,11 +148,17 @@ build_ios() {
   #    (`-Dorg.lwjgl.sdl.libname`) 으로 가리킬 수 있는 **파일**이어야 한다.
   #    앱 번들 안의 dylib 은 iOS 에서도 dlopen 되며, 이미 libmobileglues.dylib 을
   #    같은 방식으로 쓰고 있다. 정적으로 링크하면 이 경로가 막힌다.
+  patch_ios_mainthread "$WORK/src"
+
   cmake -S "$WORK/src" -B "$WORK/ios" "${COMMON[@]}" \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-    -DSDL_SHARED=ON -DSDL_STATIC=OFF >/dev/null
-  cmake --build "$WORK/ios" -j"$(sysctl -n hw.ncpu)" >/dev/null
+    -DSDL_SHARED=ON -DSDL_STATIC=OFF > "$WORK/ios-cfg.log" 2>&1 || {
+      echo "  ✗ cmake 구성 실패:"; tail -20 "$WORK/ios-cfg.log" | sed 's/^/    /'; return 1; }
+  # ⚠️ 출력을 버리지 않는다. 컴파일 오류가 여기로 나오는데 /dev/null 이면
+  #    rc=1 만 남아서 무엇이 깨졌는지 알 수 없다(실제로 두 번 헤맸다).
+  cmake --build "$WORK/ios" -j"$(sysctl -n hw.ncpu)" > "$WORK/ios-build.log" 2>&1 || {
+      echo "  ✗ 빌드 실패:"; grep -E "error:" "$WORK/ios-build.log" | head -12 | sed 's/^/    /'; return 1; }
 
   local lib
   lib=$(find "$WORK/ios" -name "libSDL3*.dylib" -type f | head -1)
