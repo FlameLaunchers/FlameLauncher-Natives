@@ -17,7 +17,7 @@
 
 # 🇰🇷 한국어
 
-iOS 에서 마인크래프트 자바 에디션을 돌리려면 렌더러·LWJGL·GLFW·P2P 네트워킹을 전부
+iOS 에서 마인크래프트 자바 에디션을 돌리려면 렌더러·LWJGL·GLFW·SDL3·P2P 네트워킹을 전부
 `aarch64-apple-ios` 로 빌드해야 하는데, **업스트림 어디에도 iOS 빌드가 없습니다.**
 안드로이드 빌드가 있어도 그대로는 컴파일조차 되지 않습니다.
 
@@ -27,9 +27,10 @@ iOS 에서 마인크래프트 자바 에디션을 돌리려면 렌더러·LWJGL�
 다른 런처에서도 그대로 쓸 수 있습니다.
 
 ```
-Scripts/     빌드 스크립트. CI 가 정확히 이것을 돌립니다
-patches/     각 스크립트가 만드는 diff 전체 (974줄)
-licenses/    패치 대상 업스트림 7곳의 라이선스 전문
+Scripts/       빌드 스크립트. CI 가 정확히 이것을 돌립니다
+patches/       각 스크립트가 만드는 diff 전체 (974줄)
+JavaPatches/   build-javaapp.sh 가 launcher.jar 에 넣는 자바 스텁
+licenses/      빌드하는 업스트림 9곳의 라이선스 전문
 ```
 
 **패치한 업스트림 트리를 통째로 두지 않습니다.** 서브모듈까지 합치면 수백 MB 인데 그중
@@ -48,8 +49,10 @@ licenses/    패치 대상 업스트림 7곳의 라이선스 전문
 | `build-mobileglues.sh` | 19 | 29 | 766줄 | `libmobileglues.dylib` |
 | `build-terracotta.sh` | 7 | 7 | 137줄 | `libterracotta.a` |
 | `build-javaapp.sh` | 3 | 3 | 71줄 | `lwjgl.jar` · `launcher.jar` |
-| `build-lwjgl-natives.sh` | — | — | — | `liblwjgl*.dylib` (3.4.1) |
+| `build-sdl3.sh` | 50 | 52 | — | `libSDL3.dylib` |
+| `build-lwjgl-natives.sh` | — | — | — | `liblwjgl*.dylib` (3.4.3) |
 | `build-spirv-cross.sh` | — | — | — | `libspirv-cross.dylib` |
+| `build-shaderc.sh` | — | — | — | `libshaderc.dylib` |
 
 ### 렌더러 — `build-mobileglues.sh` (19개)
 
@@ -136,9 +139,9 @@ uint16_t terracotta_ios_start(const char *dataDir);   // 제어 서버를 띄우
 > 계정으로 서명되지 않습니다. EasyTier 의 no-TUN 모드로 동작하므로 문서화된 제약이 그대로
 > 적용됩니다 — 방장 노릇은 되고, 참가는 주소를 직접 넣어야 합니다.
 
-### LWJGL 3.4.1 — `build-lwjgl-natives.sh`
+### LWJGL 3.4.x — `build-lwjgl-natives.sh`
 
-마인크래프트 26.2 가 요구하고, **3.3.3 과 섞을 수 없습니다** — 3.4 에서 콜백 인프라
+마인크래프트 26.2 가 3.4.1, 26.3 이 3.4.3 을 요구하고, **3.3.3 과 섞을 수 없습니다** — 3.4 에서 콜백 인프라
 (`Upcalls`, `ffi_get_closure_size`, `Callback$Descriptor`)가 새로 생겨 자바와 네이티브가
 같은 버전이어야 합니다.
 
@@ -147,6 +150,10 @@ uint16_t terracotta_ios_start(const char *dataDir);   // 제어 서버를 띄우
 `defined(LWJGL_MACOS) && defined(LWJGL_arm64)` 로 가릅니다 — **소문자 `arm64`** 입니다.
 `LWJGL_ARM64` 로 넘기면 조용히 틀린 오프셋이 잡히고, 콜백의 `user_data` 가 0 으로 읽혀
 게임이 죽습니다.
+
+기본은 **3.4.3** 입니다. 자바 jar 과 네이티브는 패치 버전까지 같아야 합니다 — 3.4.3 jar 에
+3.4.1 네이티브를 물리면 `MemoryUtil.ngetPageSize` 가 없어 클래스 초기화에서 죽고, LWJGL 을
+쓰는 모든 것이 연쇄로 무너집니다.
 
 ### GLFW 심 — `build-javaapp.sh` (3개)
 
@@ -159,10 +166,50 @@ IME/preedit 콜백 3종.
 `GLFW_IME`(3.4 신규)를 묻습니다. IME 만 특별히 봐 주는 대신 함수 한 곳에서 막고, 기본값은
 실제 GLFW 와 맞춥니다(커서는 `NORMAL`, 그 밖엔 `FALSE`).
 
+26.3 부터는 `JavaPatches/` 의 `ca.weblite.objc` 스텁도 넣습니다. 게임이 `os.name`("Mac OS X")만
+보고 AppKit 손질을 부르는데, 그 안쪽 JNA 가 iOS 에서 `NoClassDefFoundError` 로 부팅을 끝냅니다.
+`MacosUtil` 을 직접 가리면 클라이언트 jar 서명과 충돌해서 한 단계 아래를 가립니다.
+
 ### `build-spirv-cross.sh`
 
 마인크래프트 26.2 의 blaze3d 가 `libspirv-cross` 를 요구합니다. `spvc_*` C API 만 필요하므로
 그것만 내보내는 dylib 을 만듭니다.
+
+### 창·입력 — `build-sdl3.sh` (50개)
+
+마인크래프트 26.3 은 GLFW 를 버리고 **SDL3** 로 갔습니다. SDL3 는 iOS 백엔드(uikit)를 원래
+갖고 있어서 GLFW 때처럼 통째로 재구현할 필요는 없습니다. 다만 그 백엔드는 **SDL 이 앱을
+소유한다**는 전제로 쓰였고, 런처 안에서는 그 전제가 깨집니다.
+
+**① UIKit 을 렌더 스레드에서 만진다 (46개)**
+
+게임은 SDL 을 렌더 스레드에서 부르는데, uikit 백엔드는 창·화면·텍스트 입력·종료에서 UIKit 을
+건드립니다. 메인 스레드가 아니면 로그 한 줄 없이 죽거나 FrontBoard 가 트랩을 겁니다. 그런
+진입점을 `dispatch_sync_f` 로 메인에 넘기고, 이미 메인이면 그대로 부릅니다. 목록은
+**선언을 파싱해 자동 생성**합니다.
+
+> 찍어 맞히던 시기가 있었습니다. 감싸는 진입점을 3 → 11 → 27 → 37개로 늘렸는데도 같은
+> 자리에서 같은 예외가 났고, `NSSetUncaughtExceptionHandler` 로 심볼 있는 스택을 찍자 한 번에
+> 나왔습니다 — `SDL_Vulkan_CreateSurface`. 26.3 은 GL 이 아니라 **Vulkan** 으로 그립니다.
+
+**② 창 크기를 이벤트 없이 바꾼다**
+
+창을 만들 때 실제 크기를 `window->w/h` 에 바로 넣어서, 뒤따르는 RESIZED 는 같은 값이라
+걸러집니다. 게임은 화면 크기를 `--width/--height`(기본 854×480)로 시작해 RESIZED 로만 고치므로
+끝까지 854×480 이라 믿었고, 터치가 화면 아래로 갈수록 위로 밀렸습니다. 창을 다 만든 뒤 실제
+크기를 한 번 직접 알립니다.
+
+**③ 백그라운드에서 GPU 를 쓴다**
+
+iOS 는 백그라운드 앱의 GPU 작업을 거부하고, MoltenVK 는 그걸 장치 손실로 봅니다 — 홈으로
+나가면 게임이 `VK_ERROR_DEVICE_LOST` 로 죽었습니다. 게임은 SDL 알림을 보지 않지만 매 프레임
+이벤트를 펌프하므로, 앱이 비활성인 동안 그 자리에서 스레드를 세웁니다.
+
+### `build-shaderc.sh`
+
+26.3 의 렌더 엔진은 GLSL 을 **실행 중에** SPIR-V 로 컴파일합니다. LWJGL 3.4.3 이 요구하는
+진입점 45개 중 하나(`shaderc_compile_options_set_max_id_bound`)가 예전 바이너리에 없어서 태그를
+고정해 새로 빌드하고, 끝에서 필수 심볼을 직접 확인합니다(없으면 거기서 멈춥니다).
 
 ---
 
@@ -187,8 +234,10 @@ cd FlameLauncher-Natives
 ./Scripts/build-mobileglues.sh            # 렌더러
 ./Scripts/build-terracotta.sh --release   # 온라인 LAN
 ./Scripts/build-spirv-cross.sh            # 마인크래프트 26.2
-./Scripts/build-lwjgl-natives.sh          # LWJGL 3.4.1 네이티브
-LWJGL_VERSION=3.4.1 ./Scripts/build-javaapp.sh   # 26.2 용 자바 스택
+./Scripts/build-shaderc.sh                # 마인크래프트 26.3 셰이더 컴파일러
+./Scripts/build-sdl3.sh ios               # 마인크래프트 26.3 창·입력
+./Scripts/build-lwjgl-natives.sh          # LWJGL 3.4.3 네이티브
+LWJGL_VERSION=3.4.3 ./Scripts/build-javaapp.sh   # 26.2 · 26.3 용 자바 스택
 ```
 
 산출물은 `Runtime/` 아래에 떨어집니다. 런처 프로젝트로 가져가 링크하면 됩니다.
@@ -249,12 +298,14 @@ gh workflow run "iOS 네이티브 빌드" -R FlameLaunchers/FlameLauncher-Native
 | | [LWJGL](https://github.com/LWJGL/lwjgl3) | BSD-3-Clause |
 | `build-lwjgl-natives.sh` | [LWJGL](https://github.com/LWJGL/lwjgl3) · [libffi](https://github.com/libffi/libffi) | BSD-3-Clause · MIT |
 | `build-spirv-cross.sh` | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Apache-2.0 |
+| `build-sdl3.sh` | [SDL](https://github.com/libsdl-org/SDL) | Zlib |
+| `build-shaderc.sh` | [shaderc](https://github.com/google/shaderc) · [glslang](https://github.com/KhronosGroup/glslang) · [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | Apache-2.0 · BSD-3-Clause 외 · Apache-2.0 |
 
 개별 패치를 그 자체의 조건으로 쓰고 싶다면, **MobileGlues 파일에 대한 패치는 LGPL-2.1-only
 로도 동등하게 이용 가능**하고, Amethyst-iOS 파일에 대한 패치는 GPL-3.0 으로 이용 가능합니다
 — 각각 고치는 파일과 같은 라이선스입니다. AGPL-3.0 은 이 모음 전체에 적용됩니다.
 
-업스트림 7곳의 라이선스 전문을 [`licenses/`](licenses) 에 그대로 넣어 뒀습니다.
+업스트림 9곳의 라이선스 전문을 [`licenses/`](licenses) 에 그대로 넣어 뒀습니다.
 
 각 패치는 삽입 지점을 찾으려고 업스트림 파일의 짧은 발췌를 인용합니다. 그 발췌는 위
 저장소들에서 온 것이며, 파일 안의 **위치를 가리키는 용도로만** 들어 있습니다.
@@ -271,7 +322,7 @@ gh workflow run "iOS 네이티브 빌드" -R FlameLaunchers/FlameLauncher-Native
 
 # 🇺🇸 English
 
-Running Minecraft Java on iOS means building the renderer, LWJGL, GLFW and the P2P
+Running Minecraft Java on iOS means building the renderer, LWJGL, GLFW, SDL3 and the P2P
 networking for `aarch64-apple-ios` — and **no upstream ships an iOS build.** Where an
 Android build exists, it does not even compile as-is.
 
@@ -281,9 +332,10 @@ This repository is the set of patches that close that gap. It was written for
 unchanged.
 
 ```
-Scripts/     the build scripts; CI runs exactly these
-patches/     the complete diff each script produces (974 lines)
-licenses/    the full licence text of all seven upstreams that get patched
+Scripts/       the build scripts; CI runs exactly these
+patches/       the complete diff each script produces (974 lines)
+JavaPatches/   Java stubs that build-javaapp.sh puts into launcher.jar
+licenses/      the full licence text of all nine upstreams that get built
 ```
 
 **Patched upstream trees are not vendored.** With submodules that would be hundreds of
@@ -302,8 +354,10 @@ stops right there** rather than silently missing and producing a wrong binary.
 | `build-mobileglues.sh` | 19 | 29 | 766 lines | `libmobileglues.dylib` |
 | `build-terracotta.sh` | 7 | 7 | 137 lines | `libterracotta.a` |
 | `build-javaapp.sh` | 3 | 3 | 71 lines | `lwjgl.jar` · `launcher.jar` |
-| `build-lwjgl-natives.sh` | — | — | — | `liblwjgl*.dylib` (3.4.1) |
+| `build-sdl3.sh` | 50 | 52 | — | `libSDL3.dylib` |
+| `build-lwjgl-natives.sh` | — | — | — | `liblwjgl*.dylib` (3.4.3) |
 | `build-spirv-cross.sh` | — | — | — | `libspirv-cross.dylib` |
+| `build-shaderc.sh` | — | — | — | `libshaderc.dylib` |
 
 ### The renderer — `build-mobileglues.sh` (19)
 
@@ -392,9 +446,9 @@ FFI per call, and less to break when upstream moves.
 > signed with a free developer account. EasyTier's no-TUN mode applies, with its documented
 > limitation: hosting works, joining needs the address entered by hand.
 
-### LWJGL 3.4.1 — `build-lwjgl-natives.sh`
+### LWJGL 3.4.x — `build-lwjgl-natives.sh`
 
-Required by Minecraft 26.2, and **not mixable with 3.3.3** — 3.4 introduced new callback
+Minecraft 26.2 requires 3.4.1 and 26.3 requires 3.4.3, and neither is **mixable with 3.3.3** — 3.4 introduced new callback
 infrastructure (`Upcalls`, `ffi_get_closure_size`, `Callback$Descriptor`), so the Java side
 and the natives must match.
 
@@ -403,6 +457,10 @@ changes the field offsets of `ffi_closure`, and LWJGL's `ffi.h` gates that on
 `defined(LWJGL_MACOS) && defined(LWJGL_arm64)` — **lowercase `arm64`**. Passing
 `LWJGL_ARM64` silently selects the wrong offsets, a callback's `user_data` reads as 0, and
 the game dies.
+
+The default is **3.4.3**. The Java jars and the natives must match down to the patch
+version — a 3.4.3 jar over 3.4.1 natives has no `MemoryUtil.ngetPageSize`, class
+initialisation fails, and everything that touches LWJGL falls over with it.
 
 ### GLFW shims — `build-javaapp.sh` (3)
 
@@ -416,10 +474,55 @@ Minecraft 26.2 asks for `GLFW_IME` (new in 3.4) every tick. Rather than special-
 the guard goes in the one function, with defaults matching real GLFW (`NORMAL` for the
 cursor, `FALSE` otherwise).
 
+From 26.3 it also adds the `ca.weblite.objc` stubs in `JavaPatches/`. The game looks only at
+`os.name` ("Mac OS X") and calls into AppKit, whose JNA underside ends the boot on iOS with
+`NoClassDefFoundError`. Shadowing `MacosUtil` itself collides with the client jar's
+signature, so the stubs sit one level down.
+
 ### `build-spirv-cross.sh`
 
 Minecraft 26.2's blaze3d wants `libspirv-cross`. Only the `spvc_*` C API is needed, so the
 dylib exports just that.
+
+### Windowing and input — `build-sdl3.sh` (50)
+
+Minecraft 26.3 dropped GLFW for **SDL3**. SDL3 already has an iOS backend (uikit), so there is
+no need to reimplement everything the way GLFW required. But that backend was written on the
+premise that **SDL owns the app**, and inside a launcher the premise does not hold.
+
+**① UIKit touched from the render thread (46)**
+
+The game calls SDL from its render thread, and the uikit backend reaches into UIKit for
+windows, screens, text input and shutdown. Off the main thread that either dies without a
+log line or trips a FrontBoard trap. Those entry points are marshalled to the main thread
+with `dispatch_sync_f`, or called directly when already there. The list is **generated by
+parsing the declarations**, not written by hand.
+
+> There was a guessing phase. The wrapped set grew 3 → 11 → 27 → 37 and the same exception
+> fired at the same spot; printing a symbolicated stack with `NSSetUncaughtExceptionHandler`
+> answered it in one go — `SDL_Vulkan_CreateSurface`. 26.3 renders with **Vulkan**, not GL.
+
+**② A window size set without an event**
+
+Window creation writes the real size straight into `window->w/h`, so the RESIZED that follows
+carries the same values and gets filtered. The game starts its screen size from
+`--width/--height` (854×480 by default) and only updates it on RESIZED, so it believed
+854×480 forever, and touches drifted upward the lower you pressed. After the window is built,
+the real size is announced once explicitly.
+
+**③ GPU work in the background**
+
+iOS refuses GPU work from a background app, and MoltenVK treats that as a lost device —
+leaving to the home screen killed the game with `VK_ERROR_DEVICE_LOST`. The game ignores SDL's
+notifications but pumps events every frame, so that thread is parked right there while the
+app is inactive.
+
+### `build-shaderc.sh`
+
+26.3's render engine compiles GLSL to SPIR-V **at runtime**. One of the 45 entry points LWJGL
+3.4.3 requires (`shaderc_compile_options_set_max_id_bound`) was missing from the older binary,
+so this builds a pinned tag and checks the required symbols at the end, stopping if any is
+absent.
 
 ---
 
@@ -444,8 +547,10 @@ cd FlameLauncher-Natives
 ./Scripts/build-mobileglues.sh            # renderer
 ./Scripts/build-terracotta.sh --release   # online LAN
 ./Scripts/build-spirv-cross.sh            # Minecraft 26.2
-./Scripts/build-lwjgl-natives.sh          # LWJGL 3.4.1 natives
-LWJGL_VERSION=3.4.1 ./Scripts/build-javaapp.sh   # Java stack for 26.2
+./Scripts/build-shaderc.sh                # Minecraft 26.3 shader compiler
+./Scripts/build-sdl3.sh ios               # Minecraft 26.3 windowing and input
+./Scripts/build-lwjgl-natives.sh          # LWJGL 3.4.3 natives
+LWJGL_VERSION=3.4.3 ./Scripts/build-javaapp.sh   # Java stack for 26.2 and 26.3
 ```
 
 Everything lands under `Runtime/`; take it into your launcher project and link it.
@@ -509,6 +614,8 @@ several licences at once, the collection as a whole matches the strongest among 
 | | [LWJGL](https://github.com/LWJGL/lwjgl3) | BSD-3-Clause |
 | `build-lwjgl-natives.sh` | [LWJGL](https://github.com/LWJGL/lwjgl3) · [libffi](https://github.com/libffi/libffi) | BSD-3-Clause · MIT |
 | `build-spirv-cross.sh` | [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross) | Apache-2.0 |
+| `build-sdl3.sh` | [SDL](https://github.com/libsdl-org/SDL) | Zlib |
+| `build-shaderc.sh` | [shaderc](https://github.com/google/shaderc) · [glslang](https://github.com/KhronosGroup/glslang) · [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) | Apache-2.0 · BSD-3-Clause and others · Apache-2.0 |
 
 If you want a single patch on its own terms: the patch to a MobileGlues file is **equally
 available to you under LGPL-2.1-only**, and the patch to an Amethyst-iOS file under

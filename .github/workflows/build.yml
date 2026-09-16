@@ -48,14 +48,24 @@ jobs:
         if: ${{ inputs.targets == '' || contains(inputs.targets, 'spirv') }}
         run: ./Scripts/build-spirv-cross.sh
 
-      # ── LWJGL 3.4.1 (마인크래프트 26.2) ─────────────────────────────────
+      # 26.3 의 renderpearl 이 GLSL 을 런타임에 SPIR-V 로 컴파일한다.
+      - name: shaderc
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'shaderc') }}
+        run: ./Scripts/build-shaderc.sh
+
+      # ── LWJGL 3.4.3 (마인크래프트 26.2 · 26.3) ──────────────────────────
       - name: LWJGL 네이티브
         if: ${{ inputs.targets == '' || contains(inputs.targets, 'lwjgl') }}
-        run: ./Scripts/build-lwjgl-natives.sh
+        run: ./Scripts/build-lwjgl-natives.sh 3.4.3
 
-      - name: 자바 스택 (LWJGL 3.4.1)
+      - name: 자바 스택 (LWJGL 3.4.3)
         if: ${{ inputs.targets == '' || contains(inputs.targets, 'javaapp') }}
-        run: LWJGL_VERSION=3.4.1 EMIT_PATCH_DIR="$PWD/patches-built" ./Scripts/build-javaapp.sh
+        run: LWJGL_VERSION=3.4.3 EMIT_PATCH_DIR="$PWD/patches-built" ./Scripts/build-javaapp.sh
+
+      # ── 창·입력 (마인크래프트 26.3 — GLFW 대신 SDL3) ───────────────────
+      - name: SDL3
+        if: ${{ inputs.targets == '' || contains(inputs.targets, 'sdl3') }}
+        run: ./Scripts/build-sdl3.sh ios
 
       # ── 온라인 LAN ──────────────────────────────────────────────────────
       - name: 테라코타

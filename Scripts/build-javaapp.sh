@@ -85,9 +85,14 @@ grep -rl "AngelAuraAmethyst" "$WORK/src/JavaApp/src" \
 #    올려 쓰려면 명시적으로:  LWJGL_VERSION=3.4.1 Scripts/build-javaapp.sh
 #    그때는 Scripts/build-lwjgl-natives.sh 로 네이티브도 같은 버전으로 맞춰야 한다.
 LWJGL_VERSION="${LWJGL_VERSION:-}"
+# ⚠️ lwjgl-sdl 은 26.3 부터 필요하다. 그 버전이 GLFW 를 **완전히 버리고** SDL3 로
+#    갔기 때문이다(26.3 의 version.json 에 glfw 라이브러리가 0개다).
+#    바닐라 jar 을 클래스패스에 섞으면 안 되고(아래 shouldDropVanillaLwjgl 주석 참고)
+#    이렇게 병합본 안에 넣어야 한다 — 26.2 의 spvc 와 같은 처리다.
+#    코어 쪽 준비는 이미 돼 있다: 3.4.1 의 Configuration 에 SDL_LIBRARY_NAME 이 있다.
 LWJGL_MODULES="lwjgl lwjgl-glfw lwjgl-opengl lwjgl-openal lwjgl-stb lwjgl-tinyfd \
                lwjgl-vma lwjgl-freetype lwjgl-vulkan lwjgl-nanovg lwjgl-shaderc \
-               lwjgl-spvc lwjgl-jemalloc"
+               lwjgl-spvc lwjgl-jemalloc lwjgl-sdl"
 if [ -n "$LWJGL_VERSION" ]; then
 echo "▸ LWJGL $LWJGL_VERSION 로 입력 jar 교체"
 # lwjglx(레거시 호환)는 업스트림 LWJGL 이 아니라 그대로 둔다.
@@ -108,6 +113,18 @@ python3 - "$WORK/src/JavaApp/src/lwjgl/org/lwjgl/glfw/GLFW.java" "$LWJGL_VERSION
 import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 s = p.read_text()
+
+# 0) JNI.invokeI 시그니처 변화 (3.4.3).
+#
+#    3.4.1 까지는 boolean 을 그대로 넘겼는데 3.4.3 에서 int 만 받게 바뀌었다:
+#      GLFW.java:796: error: incompatible types: boolean cannot be converted to int
+#        isGLFWReady = invokeI(!isCalledFromLWJGLX, __functionAddress) != 0;
+#
+#    26.3 은 GLFW 를 아예 안 쓰지만(SDL3 로 갔다) 이 파일은 여전히 컴파일돼야 한다.
+old = "invokeI(!isCalledFromLWJGLX, __functionAddress)"
+if old in s:
+    s = s.replace(old, "invokeI(!isCalledFromLWJGLX ? 1 : 0, __functionAddress)")
+    print("  GLFW.java: invokeI 에 boolean→int (3.4.3)")
 
 # 1) glfwPlatformSupported — 26.2 의 GLX._initGlfw 가 부팅 첫머리에 부른다.
 #    없으면 NoSuchMethodError 로 게임 초기화 단계에서 죽는다.
@@ -184,7 +201,15 @@ GLFWPATCH
 emit_patch "$WORK/src" amethyst-javaapp
 
 echo "▸ 컴파일"
-make -C "$WORK/src/JavaApp" -j"$(sysctl -n hw.ncpu)" BOOTJDK="$BOOTJDK" >/dev/null
+# ⚠️ stdout 을 버리지 않는다. 예전에는 `>/dev/null` 이었는데, Makefile 의 검사들이
+#    실패 이유를 **stdout 으로** 말한다(check_empty_classes 가 어떤 파일이 비었는지
+#    echo 한다). 그걸 버리면 `make: *** [check_empty_classes] Error 1` 만 남아서
+#    무엇이 잘못됐는지 알 수 없다 — 실제로 두 번 헤맸다.
+if ! make -C "$WORK/src/JavaApp" -j"$(sysctl -n hw.ncpu)" BOOTJDK="$BOOTJDK" > "$WORK/make.log" 2>&1; then
+  echo "▸ make 실패 — 마지막 40줄:"
+  tail -40 "$WORK/make.log" | sed 's/^/    /'
+  exit 1
+fi
 
 BUILD="$WORK/src/JavaApp/build"
 echo "▸ FlameLauncher 자체 부트스트랩 컴파일"
@@ -214,6 +239,21 @@ mkdir -p "$WORK/t2s"
   -C "$WORK/t2s" 'com/mojang/text2speech/Narrator$InitializeException.class' \
   -C "$WORK/t2s" 'com/mojang/text2speech/OperatingSystem.class' \
   -C "$WORK/t2s" 'com/mojang/text2speech/NarratorMac.class'
+
+# ⚠️ 26.3+ 의 macOS 전용 창 손질을 끈다. 마인크래프트는 os.name 만 보고 macOS 분기를
+#    타는데(iOS 는 "Mac OS X" 로 보고된다) 그 안쪽이 Rococoa → JNA → AppKit 이라
+#    iOS 에서 NoClassDefFoundError 로 부팅이 끝난다. Error 라 try/catch 에도 안 걸린다:
+#      at ca.weblite.objc.Runtime.<clinit>
+#      at com.mojang.blaze3d.platform.MacosUtil.disableCloseWindowMenuItem
+#      at com.mojang.blaze3d.platform.Window.<init>
+#    ⚠️ MacosUtil 을 직접 가리려 했으나 **클라이언트 jar 이 서명돼 있어**
+#       같은 패키지에 서명 없는 클래스를 끼우면 JVM 이 거부한다:
+#         SecurityException: … signer information does not match …
+#       java-objc-bridge 는 서명이 없으므로 한 단계 아래를 가린다.
+#       (JavaPatches/ca/weblite/objc/)
+"$BOOTJDK/jar" uf "$BUILD/launcher.jar" \
+  -C "$WORK/t2s" 'ca/weblite/objc/Client.class' \
+  -C "$WORK/t2s" 'ca/weblite/objc/Proxy.class'
 
 for j in lwjgl.jar launcher.jar patchjna_agent.jar flame_bootstrap.jar; do
   [ -f "$BUILD/$j" ] || { echo "빌드 산출물 없음: $j"; exit 1; }

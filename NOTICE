@@ -32,11 +32,19 @@ as a whole is distributed under the strongest of them -- Terracotta's AGPL-3.0.
     build-lwjgl-natives.sh    LWJGL                   BSD-3-Clause
                               libffi                  MIT
     build-spirv-cross.sh      SPIRV-Cross             Apache-2.0
+    build-sdl3.sh             SDL                     Zlib
+    build-shaderc.sh          shaderc                 Apache-2.0
+                              glslang                 BSD-3-Clause and others
+                              SPIRV-Tools             Apache-2.0
 
 If you want a single patch on its own terms, the patch to a MobileGlues file is
 equally available to you under LGPL-2.1-only, and the patch to an Amethyst-iOS
 file under GPL-3.0 -- each matching the file it modifies. AGPL-3.0 applies to
 the collection.
+
+
+build-shaderc.sh builds its upstreams without modifying them; glslang and
+SPIRV-Tools come in through shaderc's own pinned dependency set.
 
 
 WHERE TO FIND THINGS
