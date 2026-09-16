@@ -51,17 +51,20 @@ COMMON=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF)
 
 build_ios() {
   echo "▸ iOS arm64"
-  # ⚠️ 정적 라이브러리다. iOS 는 앱 번들 밖의 dylib 을 dlopen 할 수 없어서
-  #    다른 네이티브들과 마찬가지로 **앱 바이너리에 함께 링크**한다.
-  #    (그래서 LWJGL 이 SDL 심볼을 메인 실행 파일에서 찾게 된다 — GLFW JNI 와 같은 구조)
+  # ⚠️ **dylib** 으로 만든다. LWJGL 의 org.lwjgl.sdl.SDL 은 정적 심볼을 찾지 않고
+  #    `Library.loadNative` 로 연다 — 즉 `Configuration.SDL_LIBRARY_NAME`
+  #    (`-Dorg.lwjgl.sdl.libname`) 으로 가리킬 수 있는 **파일**이어야 한다.
+  #    앱 번들 안의 dylib 은 iOS 에서도 dlopen 되며, 이미 libmobileglues.dylib 을
+  #    같은 방식으로 쓰고 있다. 정적으로 링크하면 이 경로가 막힌다.
   cmake -S "$WORK/src" -B "$WORK/ios" "${COMMON[@]}" \
     -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-    -DSDL_SHARED=OFF -DSDL_STATIC=ON >/dev/null
+    -DSDL_SHARED=ON -DSDL_STATIC=OFF >/dev/null
   cmake --build "$WORK/ios" -j"$(sysctl -n hw.ncpu)" >/dev/null
 
-  local lib="$WORK/ios/libSDL3.a"
-  [ -f "$lib" ] || { echo "  ✗ libSDL3.a 가 없습니다"; return 1; }
+  local lib
+  lib=$(find "$WORK/ios" -name "libSDL3*.dylib" -type f | head -1)
+  [ -n "$lib" ] || { echo "  ✗ libSDL3 dylib 이 없습니다"; return 1; }
 
   # cmake 는 타깃을 틀려도 조용히 성공한다. 앱에 넣는 순간에야 알게 되므로 여기서 자른다.
   case "$(lipo -info "$lib")" in *arm64*) ;; *) echo "  ✗ arm64 가 아닙니다"; return 1 ;; esac
@@ -75,15 +78,18 @@ build_ios() {
   #    없다고 보고한다. (build-terracotta.sh 에 같은 함정을 적어 뒀는데 또 걸렸다)
   #    한 번만 읽어서 변수에 담고 거기서 찾는다.
   local syms; syms=$(nm -gU "$lib")
+  # ⚠️ 번들 안에서 열리려면 install_name 이 @rpath 여야 한다. cmake 는 빌드 경로를
+  #    박아 두므로 그대로 두면 기기에서 dlopen 이 실패한다.
+  install_name_tool -id "@rpath/libSDL3.dylib" "$lib" 2>/dev/null || true
   for sym in _SDL_Init _SDL_CreateWindow _SDL_GL_CreateContext _SDL_GL_SwapWindow _SDL_PollEvent; do
     case "$syms" in *" T $sym"*) ;; *) echo "  ✗ $sym 없음"; return 1 ;; esac
   done
 
   mkdir -p "$ROOT/Runtime/SDL3"
-  cp "$lib" "$ROOT/Runtime/SDL3/libSDL3.a"
+  cp "$lib" "$ROOT/Runtime/SDL3/libSDL3.dylib"
   mkdir -p "$ROOT/Runtime/SDL3/include"
   cp -R "$WORK/src/include/SDL3" "$ROOT/Runtime/SDL3/include/"
-  echo "  완료: Runtime/SDL3/libSDL3.a ($(du -h "$lib" | cut -f1))"
+  echo "  완료: Runtime/SDL3/libSDL3.dylib ($(du -h "$lib" | cut -f1))"
 }
 
 build_android() {
