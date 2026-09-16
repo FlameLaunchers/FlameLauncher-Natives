@@ -19,3 +19,6 @@ build*/
 *.swp
 .idea/
 .vscode/
+
+# SDL3 빌드 산출물 — build-sdl3.sh 가 만든다(용량이 커서 커밋하지 않는다).
+Runtime/SDL3/
