@@ -135,6 +135,27 @@ for path in ("src/SDL.c", "src/video/SDL_video.c", "src/events/SDL_mouse.c"):
     q = root / path
     q.write_text(q.read_text() + PRELUDE)
 
+# ⚠️ Vulkan 진입점은 선언이 **여러 줄**이라 아래 파서가 못 잡는다. 한 줄로 편다.
+#    (26.3 은 Vulkan 으로 그린다 — GL 이 아니다. 실측 스택:
+#       UIKit_Vulkan_CreateSurface → UIKit_Metal_CreateView → -[SDL_uikitview setSDLWindow:]
+#     이게 UIKit 을 백그라운드에서 만져 앱이 통째로 죽던 원인이다.)
+vid = root / "src/video/SDL_video.c"
+t = vid.read_text()
+for multi, single in [
+    ("""bool SDL_Vulkan_CreateSurface(SDL_Window *window,
+                                  VkInstance instance,
+                                  const struct VkAllocationCallbacks *allocator,
+                                  VkSurfaceKHR *surface)""",
+     "bool SDL_Vulkan_CreateSurface(SDL_Window *window, VkInstance instance, const struct VkAllocationCallbacks *allocator, VkSurfaceKHR *surface)"),
+    ("""void SDL_Vulkan_DestroySurface(VkInstance instance,
+                               VkSurfaceKHR surface,
+                               const struct VkAllocationCallbacks *allocator)""",
+     "void SDL_Vulkan_DestroySurface(VkInstance instance, VkSurfaceKHR surface, const struct VkAllocationCallbacks *allocator)"),
+]:
+    assert multi in t, "Vulkan 선언을 못 찾았습니다 (업스트림이 바뀜)"
+    t = t.replace(multi, single, 1)
+vid.write_text(t)
+
 # ⚠️ GL 함수는 감싸지 않는다. SDL_GL_SwapWindow 는 매 프레임 불리고, GL 컨텍스트는
 #    스레드에 묶이므로 메인으로 넘기면 정작 그리는 스레드에서 current 가 아니게 된다.
 #    (GL 은 우리 ANGLE 로 대체할 예정이라 어차피 이 경로를 안 탄다)
@@ -181,6 +202,12 @@ for decl in [
     "bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect *rect)",
     "const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID displayID)",
     "const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID displayID)",
+    # ⚠️ **이게 실제 크래시 지점이었다.** 26.3 은 Vulkan 으로 그리고, 이 함수가
+    #    Metal 뷰를 만들며 UIKit 을 탄다.
+    "bool SDL_Vulkan_CreateSurface(SDL_Window *window, VkInstance instance, const struct VkAllocationCallbacks *allocator, VkSurfaceKHR *surface)",
+    "void SDL_Vulkan_DestroySurface(VkInstance instance, VkSurfaceKHR surface, const struct VkAllocationCallbacks *allocator)",
+    "bool SDL_Vulkan_LoadLibrary(const char *path)",
+    "void SDL_Vulkan_UnloadLibrary(void)",
 ]:
     wrap("src/video/SDL_video.c", decl)
 
