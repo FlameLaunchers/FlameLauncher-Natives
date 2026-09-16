@@ -131,7 +131,7 @@ static void flame_thunk_{name}(void *p) {{
     p.write_text(s)
     print(f"  {path}: {name}")
 
-for path in ("src/SDL.c", "src/video/SDL_video.c", "src/events/SDL_mouse.c"):
+for path in ("src/SDL.c", "src/video/SDL_video.c", "src/events/SDL_mouse.c", "src/misc/SDL_url.c"):
     q = root / path
     q.write_text(q.read_text() + PRELUDE)
 
@@ -160,6 +160,13 @@ vid.write_text(t)
 #    스레드에 묶이므로 메인으로 넘기면 정작 그리는 스레드에서 current 가 아니게 된다.
 #    (GL 은 우리 ANGLE 로 대체할 예정이라 어차피 이 경로를 안 탄다)
 wrap("src/SDL.c", "bool SDL_InitSubSystem(SDL_InitFlags flags)")
+# ⚠️ **종료도 UIKit 이다.** 26.3 은 "게임 종료" 때 렌더 스레드에서 SDL_Quit 을 부르고,
+#    SDL 은 정리하면서 화면 자동 잠금을 되돌린다. 메인이 아니면 FrontBoard 가 트랩을 건다:
+#      SDL_Quit → SDL_VideoQuit → UIKit_SuspendScreenSaver
+#      → -[UIApplication _setIdleTimerDisabled:forReason:] → assertBarrierOnQueue (EXC_BREAKPOINT)
+wrap("src/SDL.c", "void SDL_Quit(void)")
+# 채팅 링크 등 — -[UIApplication openURL:…] 을 그대로 부른다(misc/ios/SDL_sysurl.m).
+wrap("src/misc/SDL_url.c", "bool SDL_OpenURL(const char *url)")
 
 for decl in [
     "SDL_Window *SDL_CreateWindowWithProperties(SDL_PropertiesID props)",
@@ -208,6 +215,13 @@ for decl in [
     "void SDL_Vulkan_DestroySurface(VkInstance instance, VkSurfaceKHR surface, const struct VkAllocationCallbacks *allocator)",
     "bool SDL_Vulkan_LoadLibrary(const char *path)",
     "void SDL_Vulkan_UnloadLibrary(void)",
+    # ⚠️ **텍스트 입력도 UIKit 이다.** 26.3 은 입력칸(EditBox)에 포커스가 가면 렌더 스레드에서
+    #    TextInputManager.startTextInput → SDL_StartTextInput → -[UITextField becomeFirstResponder]
+    #    로 내려간다. 월드 이름·채팅·서버 주소 칸이 전부 이 경로다.
+    #    SDL_StartTextInput 은 WithProperties 를 부르기만 하므로 그쪽을 감싼다.
+    "bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID props)",
+    "bool SDL_StopTextInput(SDL_Window *window)",
+    "bool SDL_SetTextInputArea(SDL_Window *window, const SDL_Rect *rect, int cursor)",
 ]:
     wrap("src/video/SDL_video.c", decl)
 
@@ -218,6 +232,100 @@ for decl in [
     "bool SDL_HideCursor(void)",
 ]:
     wrap("src/events/SDL_mouse.c", decl)
+
+def patch(path, anchor, replacement):
+    p = root / path
+    s = p.read_text()
+    assert anchor in s, f"{path}: 앵커를 못 찾았습니다 — {anchor.strip()[:60]}"
+    p.write_text(s.replace(anchor, replacement, 1))
+    print(f"  {path}: {anchor.strip().splitlines()[0][:50]}")
+
+# ⚠️ **창 크기를 이벤트 없이 바꾼다.** SetupWindowData 가 실제 뷰 크기(852x393 pt)를
+#    window->w/h 에 바로 넣고, 뒤따르는 RESIZED 는 같은 값이라 SDL_SendWindowEvent 가 걸러 버린다.
+#    26.3 의 Window 는 화면 크기를 --width/--height(기본 854x480)로 시작해 **RESIZED 로만**
+#    고친다(Window.<init> · onResize). 그래서 게임은 끝까지 854x480 이라 믿고
+#    마우스 y 를 `y × GUI높이 / 480` 으로 계산했다 — 화면 아래로 갈수록 터치가 위로 밀렸다.
+#    창을 다 만든 뒤 실제 크기를 한 번 직접 알린다.
+patch("src/video/uikit/SDL_uikitwindow.m",
+      "    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_UIKIT_METAL_VIEW_TAG_NUMBER, SDL_METALVIEW_TAG);\n",
+      """    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_UIKIT_METAL_VIEW_TAG_NUMBER, SDL_METALVIEW_TAG);
+
+    /* FlameLauncher: 위에서 이벤트 없이 바꾼 크기를 앱에 알린다(Scripts/build-sdl3.sh). */
+    SDL_Event resized;
+    SDL_zero(resized);
+    resized.type = SDL_EVENT_WINDOW_RESIZED;
+    resized.window.windowID = window->id;
+    resized.window.data1 = width;
+    resized.window.data2 = height;
+    SDL_PushEvent(&resized);
+""")
+
+# ⚠️ **백그라운드에서는 이벤트를 펌프하는 스레드를 세운다.**
+#    iOS 는 백그라운드 앱의 GPU 작업을 거부하고, MoltenVK 는 그걸 장치 손실로 본다.
+#    홈으로 나가거나 화면을 잠그면 게임이 그대로 죽었다:
+#      Lost VkDevice … Insufficient Permission (to submit GPU work from background)
+#      GpuDeviceLossException: VK_ERROR_DEVICE_LOST: Failed to wait for semaphore
+#    (GL 경로는 ANGLE 이 실패를 삼켜서 안 드러났다.)
+#    26.3 은 SDL_EVENT_WILL_ENTER_BACKGROUND 를 보지 않는다. 대신 렌더 스레드가 매 프레임
+#    SDL_PollEvent 로 이벤트를 펌프하므로, 거기서 세우면 그리기도 함께 멈춘다.
+#    SDL 은 WillResignActive → WillEnterBackground, DidBecomeActive → DidEnterForeground 로
+#    짝지어 부른다(SDL_uikitevents.m) — 알림 센터를 내리는 것만으로도 멈췄다 풀린다.
+#    UIKit 메인 스레드는 세우지 않는다. 풀어 줄 알림을 받는 스레드다.
+patch("src/events/SDL_events.c",
+      "static void SDL_PumpEventsInternal(bool push_sentinel)\n{\n",
+      """#ifdef SDL_PLATFORM_IOS
+/* FlameLauncher: 백그라운드에서 렌더 스레드를 세운다(Scripts/build-sdl3.sh). */
+#include <pthread.h>
+static pthread_mutex_t flame_bg_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t flame_bg_cond = PTHREAD_COND_INITIALIZER;
+static bool flame_bg;
+
+void FLAME_SetBackground(bool background)
+{
+    pthread_mutex_lock(&flame_bg_lock);
+    flame_bg = background;
+    pthread_cond_broadcast(&flame_bg_cond);
+    pthread_mutex_unlock(&flame_bg_lock);
+}
+
+static void FLAME_WaitWhileBackground(void)
+{
+    if (pthread_main_np()) {
+        return;
+    }
+    pthread_mutex_lock(&flame_bg_lock);
+    while (flame_bg) {
+        pthread_cond_wait(&flame_bg_cond, &flame_bg_lock);
+    }
+    pthread_mutex_unlock(&flame_bg_lock);
+}
+#endif
+
+static void SDL_PumpEventsInternal(bool push_sentinel)
+{
+#ifdef SDL_PLATFORM_IOS
+    FLAME_WaitWhileBackground();
+#endif
+""")
+patch("src/video/SDL_video.c",
+      "void SDL_OnApplicationWillEnterBackground(void)\n{\n",
+      """#ifdef SDL_PLATFORM_IOS
+extern void FLAME_SetBackground(bool background);
+#endif
+void SDL_OnApplicationWillEnterBackground(void)
+{
+#ifdef SDL_PLATFORM_IOS
+    FLAME_SetBackground(true);
+#endif
+""")
+patch("src/video/SDL_video.c",
+      "void SDL_OnApplicationDidEnterForeground(void)\n{\n",
+      """void SDL_OnApplicationDidEnterForeground(void)
+{
+#ifdef SDL_PLATFORM_IOS
+    FLAME_SetBackground(false);
+#endif
+""")
 SDLPATCH
 }
 
